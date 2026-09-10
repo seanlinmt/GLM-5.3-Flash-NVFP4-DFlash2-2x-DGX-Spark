@@ -14,10 +14,10 @@
 # Usage: ./launch-glm53-vllm-tp2-dflash2.sh <0|1>   -- worker (1) FIRST, then head (0)
 set -euo pipefail
 
-# GLM-5.3-Flash-NVFP4 on Reddie (head, rank 0) + Spark4 (worker, rank 1), vLLM TP2 over the fabric.
-# Official day-0 image (vLLM has glm5_next; SGLang support for this NVFP4 quant is still in-flight).
-# Day-1: NO speculative decode. MTP phase-2 after base is stable (image has Glm5NextMTPModel).
-# Run worker FIRST: Spark4 rank 1, wait ~20s, then Reddie rank 0.
+# GLM-5.3-Flash-NVFP4 (abliterated, drowzeys/keys-...-l15-45-anchorstock) on ai (head, rank 0)
+# + ai2 (worker, rank 1), vLLM TP2 over the 192.168.177.0/24 RoCE fabric.
+# Weights + drafter live on the shared gfs2 mount (/mnt/nvmeof), same path on both nodes.
+# Run worker FIRST: ai2 rank 1, wait ~25s, then ai rank 0 (serves :8000).
 NODE_RANK="${1:?usage: launch-glm53-vllm-tp2.sh <0|1>}"
 [[ "$NODE_RANK" == "0" || "$NODE_RANK" == "1" ]] || { echo "rank must be 0 or 1" >&2; exit 2; }
 
@@ -25,10 +25,10 @@ IMAGE="ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v11-dflash2"
 NAME="vllm_glm53"
 # Checkpoint. The README's documented default is RedHatAI/GLM-5.3-Flash-NVFP4
 # (compressed-tensors) because the ModelOpt builds emit intermittent corrupted token IDs
-# -- vLLM #54150, measured 4/9/8 U+FFFD on a Hangul probe vs 0/0/0 for RedHatAI. The
-# launchers previously hardcoded the ModelOpt path, so the shipped default did not match
-# the documented one. Override with MODEL_HOST_PATH=... for the legacy/abliterated builds.
-MODEL_HOST_PATH="${MODEL_HOST_PATH:-/var/tmp/models/GLM-5.3-Flash-NVFP4-redhat}"
+# -- vLLM #54150, measured 4/9/8 U+FFFD on a Hangul probe vs 0/0/0 for RedHatAI.
+# Override with MODEL_HOST_PATH=... for the legacy/abliterated builds.
+MODEL_HOST_PATH="${MODEL_HOST_PATH:-/mnt/nvmeof/models/glm-5.3-flash-nvfp4-ablit}"
+DRAFT_HOST_PATH="${DRAFT_HOST_PATH:-/mnt/nvmeof/models/GLM-5.3-Flash-DFlash2}"
 MODEL_PATH="/models/glm-5.3-flash-nvfp4"
 
 # Guard: fail loudly if the resolved checkpoint is a ModelOpt build, unless the operator
@@ -46,13 +46,13 @@ if [ -f "$MODEL_HOST_PATH/config.json" ] && [ "${ALLOW_MODELOPT:-0}" != "1" ]; t
 fi
 
 CACHE_HOST_PATH="/var/tmp/glm53-vllm-cache"
-HEAD_IP="192.168.192.2"
+HEAD_IP="192.168.177.11"
 MPORT="29521"
-PORT="8000"
+PORT="8888"
 
 case "$NODE_RANK" in
-  0) HOST_IP=192.168.192.2; HEADLESS="" ;;
-  1) HOST_IP=192.168.192.4; HEADLESS="--headless" ;;
+  0) HOST_IP=192.168.177.11; HEADLESS="" ;;
+  1) HOST_IP=192.168.177.12; HEADLESS="--headless" ;;
 esac
 
 test -f "$MODEL_HOST_PATH/config.json"
@@ -76,23 +76,23 @@ docker run --gpus all -d \
   -e NCCL_NET=IB -e NCCL_IB_DISABLE=0 \
   -e NCCL_IB_HCA=rocep1s0f0 -e NCCL_IB_GID_INDEX=3 \
   -e NCCL_IB_ROCE_VERSION_NUM=2 -e NCCL_IB_ADDR_FAMILY=AF_INET \
-  -e NCCL_IB_ADDR_RANGE=192.168.192.0/24 \
+  -e NCCL_IB_ADDR_RANGE=192.168.177.0/24 \
   -e NCCL_SOCKET_IFNAME=enp1s0f0np0 -e GLOO_SOCKET_IFNAME=enp1s0f0np0 \
   -e TP_SOCKET_IFNAME=enp1s0f0np0 -e MN_IF_NAME=enp1s0f0np0 \
   -e NCCL_NVLS_ENABLE=0 -e NCCL_CROSS_NIC=0 -e NCCL_IB_MERGE_NICS=0 \
   -e NCCL_CUMEM_ENABLE=0 -e NCCL_IGNORE_CPU_AFFINITY=1 -e NCCL_DEBUG=WARN \
   -e TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
   -v $HOME/patches/sparse_attn_indexer_kpool.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer_kpool.py:ro \
-  -v /var/tmp/models/GLM-5.3-Flash-DFlash2:/models/dflash2-draft:ro \
+  -v "$DRAFT_HOST_PATH:/models/dflash2-draft:ro" \
   "$IMAGE" \
     "$MODEL_PATH" \
     --served-model-name glm-5.3-flash \
     --host 0.0.0.0 --port "$PORT" \
     --trust-remote-code \
     --tensor-parallel-size 2 \
-    --gpu-memory-utilization 0.85 \
+    --gpu-memory-utilization 0.87 \
     --max-model-len 262144 \
-    --max-num-seqs 6 --block-size 2304 --moe-backend marlin --speculative-config '{"method":"dflash","model":"/models/dflash2-draft","num_speculative_tokens":7}' --kv-cache-dtype fp8_e4m3 --kv-cache-memory 6442450944 \
+    --max-num-seqs 6 --block-size 2304 --moe-backend marlin --speculative-config '{"method":"dflash","model":"/models/dflash2-draft","num_speculative_tokens":7}' --kv-cache-dtype fp8_e4m3 \
     --enforce-eager --max-num-batched-tokens 8192 \
     --tool-call-parser glm47 --enable-auto-tool-choice \
     --reasoning-parser glm45 --default-chat-template-kwargs '{"enable_thinking":false}' --chat-template /models/glm-5.3-flash-nvfp4/chat_template_mm.jinja \
