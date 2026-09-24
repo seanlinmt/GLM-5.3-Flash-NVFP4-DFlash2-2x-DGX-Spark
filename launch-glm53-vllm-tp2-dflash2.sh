@@ -55,6 +55,12 @@ case "$NODE_RANK" in
   1) HOST_IP=192.168.177.12; HEADLESS="--headless" ;;
 esac
 
+EXTRA_NCCL_ARGS=()
+# If GID_INDEX is explicitly set, pass it; otherwise let NCCL auto-discover RoCEv2 GIDs per adapter
+if [ -n "${GID_INDEX:-}" ]; then
+  EXTRA_NCCL_ARGS+=("-e" "NCCL_IB_GID_INDEX=$GID_INDEX")
+fi
+
 test -f "$MODEL_HOST_PATH/config.json"
 mkdir -p "$CACHE_HOST_PATH"
 docker rm -f "$NAME" 2>/dev/null || true
@@ -74,13 +80,14 @@ docker run --gpus all -d \
   -e TORCH_CUDA_ARCH_LIST=12.1a -e FLASHINFER_CUDA_ARCH_LIST=12.1a \
   -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
   -e NCCL_NET=IB -e NCCL_IB_DISABLE=0 \
-  -e NCCL_IB_HCA=rocep1s0f0 -e NCCL_IB_GID_INDEX=3 \
+  -e NCCL_IB_HCA="${NCCL_IB_HCA:-rocep1s0f0,roceP2p1s0f0}" \
+  "${EXTRA_NCCL_ARGS[@]}" \
   -e NCCL_IB_ROCE_VERSION_NUM=2 -e NCCL_IB_ADDR_FAMILY=AF_INET \
-  -e NCCL_IB_ADDR_RANGE=192.168.177.0/24 \
+  -e NCCL_IB_ADDR_RANGE="${NCCL_IB_ADDR_RANGE:-192.168.176.0/22}" \
   -e NCCL_SOCKET_IFNAME=enp1s0f0np0 -e GLOO_SOCKET_IFNAME=enp1s0f0np0 \
   -e TP_SOCKET_IFNAME=enp1s0f0np0 -e MN_IF_NAME=enp1s0f0np0 \
-  -e NCCL_NVLS_ENABLE=0 -e NCCL_CROSS_NIC=0 -e NCCL_IB_MERGE_NICS=0 \
-  -e NCCL_CUMEM_ENABLE=0 -e NCCL_IGNORE_CPU_AFFINITY=1 -e NCCL_DEBUG=WARN \
+  -e NCCL_NVLS_ENABLE=0 -e NCCL_CROSS_NIC="${NCCL_CROSS_NIC:-1}" -e NCCL_IB_MERGE_NICS="${NCCL_IB_MERGE_NICS:-1}" \
+  -e NCCL_CUMEM_ENABLE=0 -e NCCL_IGNORE_CPU_AFFINITY=1 -e NCCL_DEBUG="${NCCL_DEBUG:-WARN}" \
   -e TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
   -v $HOME/patches/sparse_attn_indexer_kpool.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer_kpool.py:ro \
   -v "$DRAFT_HOST_PATH:/models/dflash2-draft:ro" \
@@ -90,7 +97,7 @@ docker run --gpus all -d \
     --host 0.0.0.0 --port "$PORT" \
     --trust-remote-code \
     --tensor-parallel-size 2 \
-    --gpu-memory-utilization 0.87 \
+    --gpu-memory-utilization "${GPU_MEM_UTIL:-0.85}" \
     --max-model-len 262144 \
     --max-num-seqs 6 --block-size 2304 --moe-backend marlin --speculative-config '{"method":"dflash","model":"/models/dflash2-draft","num_speculative_tokens":7}' --kv-cache-dtype fp8_e4m3 \
     --enforce-eager --max-num-batched-tokens 8192 \
